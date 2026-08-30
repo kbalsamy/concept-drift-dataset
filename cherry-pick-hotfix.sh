@@ -4,33 +4,66 @@
 #
 # Generic helper to take commits that exist on a SOURCE branch but not on a
 # TARGET branch, show them for review, and cherry-pick them onto TARGET after
-# explicit confirmation. Meant to live inside the repo (e.g. scripts/) so
-# anyone can run it whenever a hotfix needs to go from a feature/dev branch
-# onto main/prod/release without guessing git commands under pressure.
+# explicit confirmation. Also supports undoing a hotfix batch later, either
+# safely (revert) or as a hard clean-slate reset. Meant to live inside the
+# repo (e.g. scripts/) so anyone can run it whenever a hotfix needs to go
+# from a feature/dev branch onto main/prod/release, confidently.
 #
 # Usage:
-#   ./cherry-pick-hotfix.sh <source-branch> <target-branch> [options]
+#   Apply a hotfix batch:
+#     ./cherry-pick-hotfix.sh <source-branch> <target-branch> [options]
 #
-# Options:
+#   List recorded hotfix runs for a branch:
+#     ./cherry-pick-hotfix.sh --list-runs <target-branch>
+#
+#   Safely undo a run (adds new revert commits, keeps history):
+#     ./cherry-pick-hotfix.sh --revert <target-branch> [--run N] [-y]
+#
+#   Hard reset a branch back to its state before a run (rewrites history):
+#     ./cherry-pick-hotfix.sh --reset-clean <target-branch> [--run N] [-y]
+#
+# Apply options:
 #   -y, --yes           Skip the batch confirmation prompt (still shows the list)
 #   -i, --interactive   Confirm each commit individually (y/n/s=skip/q=quit)
 #   -n, --dry-run       Show what would be cherry-picked, apply nothing
 #   --no-fetch          Don't run 'git fetch' before comparing branches
 #   --push              After a successful run, offer to push target to origin
+#   --squash            Combine all applied commits into a single commit on
+#                        target instead of one commit per pick. The squash
+#                        commit's body lists every original commit it includes.
+#                        All-or-nothing: on a conflict the whole squash is
+#                        rolled back (target restored to its pre-run state) -
+#                        re-run without --squash for step-by-step conflict
+#                        resolution instead.
+#
+# Undo options:
+#   --run N             Pick the Nth most recent run (1 = latest, default 1)
+#   -y, --yes           Skip confirmation
+#
 #   -h, --help          Show this help
 #
 # Behaviour notes:
 #   - Only non-merge commits reachable from SOURCE but not TARGET are considered
 #     (git log target..source --no-merges), so commits target already has
-#     (e.g. from a prior merge) are never re-applied.
+#     are never re-applied.
 #   - Commits already cherry-picked onto target in an earlier run of this
 #     script are detected (via the "(cherry picked from commit <sha>)" note
-#     that -x adds) and skipped automatically. This makes the script safe to
-#     re-run after resolving a conflict manually.
+#     that -x adds) and skipped automatically. Safe to re-run after resolving
+#     a conflict manually.
 #   - On a cherry-pick conflict, the script stops and leaves the repo in the
 #     standard git conflict state. Resolve it the normal way
 #     (git add ... && git cherry-pick --continue, or --abort), then re-run
 #     this script to pick up the remaining commits.
+#   - Every successful apply run is recorded locally under
+#     .git/cherry-pick-hotfix/<target>/ - a timestamped log of which commits
+#     were applied, plus a tag marking target's tip *before* the run. This is
+#     what --revert and --reset-clean use, and it is local-only (never pushed,
+#     never committed to the repo).
+#   - --revert creates new commits that undo the batch - safe for shared/prod
+#     branches, preserves history. Prefer this.
+#   - --reset-clean hard-resets target back to the pre-run tag - rewrites
+#     history. Only use on branches nobody else has pulled, or be ready to
+#     force-push with --force-with-lease afterwards.
 #
 set -euo pipefail
 
@@ -43,7 +76,7 @@ error() { printf '[ERROR] %s\n' "$*" >&2; }
 die()   { error "$*"; exit 1; }
 
 usage() {
-  sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 confirm() {
@@ -56,6 +89,7 @@ confirm() {
 # ---------------------------------------------------------------------------
 # Parse arguments
 # ---------------------------------------------------------------------------
+MODE="apply"           # apply | list-runs | revert | reset-clean
 SOURCE=""
 TARGET=""
 ASSUME_YES=false
@@ -63,33 +97,52 @@ INTERACTIVE=false
 DRY_RUN=false
 NO_FETCH=false
 DO_PUSH=false
+SQUASH=false
+RUN_N=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --list-runs) MODE="list-runs"; shift ;;
+    --revert) MODE="revert"; shift ;;
+    --reset-clean) MODE="reset-clean"; shift ;;
+    --run) RUN_N="$2"; shift 2 ;;
     -y|--yes) ASSUME_YES=true; shift ;;
     -i|--interactive) INTERACTIVE=true; shift ;;
     -n|--dry-run) DRY_RUN=true; shift ;;
     --no-fetch) NO_FETCH=true; shift ;;
     --push) DO_PUSH=true; shift ;;
+    --squash) SQUASH=true; shift ;;
     -h|--help) usage; exit 0 ;;
     -*)
       die "Unknown option: $1 (use -h for help)"
       ;;
     *)
-      if [[ -z "$SOURCE" ]]; then
-        SOURCE="$1"
-      elif [[ -z "$TARGET" ]]; then
-        TARGET="$1"
+      if [[ "$MODE" == "apply" ]]; then
+        if [[ -z "$SOURCE" ]]; then
+          SOURCE="$1"
+        elif [[ -z "$TARGET" ]]; then
+          TARGET="$1"
+        else
+          die "Unexpected argument: $1 (use -h for help)"
+        fi
       else
-        die "Unexpected argument: $1 (use -h for help)"
+        if [[ -z "$TARGET" ]]; then
+          TARGET="$1"
+        else
+          die "Unexpected argument: $1 (use -h for help)"
+        fi
       fi
       shift
       ;;
   esac
 done
 
-[[ -n "$SOURCE" && -n "$TARGET" ]] || { usage; die "source and target branches are required"; }
-[[ "$SOURCE" != "$TARGET" ]] || die "source and target branch are the same ($SOURCE)"
+if [[ "$MODE" == "apply" ]]; then
+  [[ -n "$SOURCE" && -n "$TARGET" ]] || { usage; die "source and target branches are required"; }
+  [[ "$SOURCE" != "$TARGET" ]] || die "source and target branch are the same ($SOURCE)"
+else
+  [[ -n "$TARGET" ]] || { usage; die "a target branch is required for --$MODE"; }
+fi
 
 # ---------------------------------------------------------------------------
 # Sanity checks
@@ -98,11 +151,6 @@ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Not inside a git rep
 
 if [[ -n "$(git status --porcelain)" ]]; then
   die "Working tree is not clean. Commit, stash, or discard changes before running this script."
-fi
-
-if [[ "$NO_FETCH" == false ]]; then
-  info "Fetching latest refs..."
-  git fetch --quiet --all --prune
 fi
 
 resolve_branch_ref() {
@@ -117,15 +165,156 @@ resolve_branch_ref() {
   fi
 }
 
+GIT_DIR="$(git rev-parse --git-dir)"
+STATE_ROOT="$GIT_DIR/cherry-pick-hotfix"
+
+# ---------------------------------------------------------------------------
+# Shared: locate a run log for TARGET (Nth most recent, 1 = latest)
+# ---------------------------------------------------------------------------
+find_run_file() {
+  local target="$1" n="$2"
+  local dir="$STATE_ROOT/$target"
+  [[ -d "$dir" ]] || die "No recorded runs for '$target'."
+  local file
+  file="$(ls -1t "$dir" 2>/dev/null | sed -n "${n}p")"
+  [[ -n "$file" ]] || die "No run #$n found for '$target'. Use --list-runs to see what's recorded."
+  echo "$dir/$file"
+}
+
+# ---------------------------------------------------------------------------
+# MODE: list-runs
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "list-runs" ]]; then
+  dir="$STATE_ROOT/$TARGET"
+  if [[ ! -d "$dir" ]]; then
+    info "No recorded runs for '$TARGET'."
+    exit 0
+  fi
+  i=1
+  for f in $(ls -1t "$dir"); do
+    src="$(grep '^source=' "$dir/$f" | cut -d= -f2-)"
+    tag="$(grep '^pretag=' "$dir/$f" | cut -d= -f2-)"
+    count="$(grep -c '^sha=' "$dir/$f" || true)"
+    ts="${f%.log}"
+    printf '%d) %s   source=%-20s commits=%-3s pretag=%s\n' "$i" "$ts" "$src" "$count" "$tag"
+    i=$((i+1))
+  done
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# MODE: revert (safe - adds new commits that undo the batch)
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "revert" ]]; then
+  RUN_FILE="$(find_run_file "$TARGET" "$RUN_N")"
+  SRC="$(grep '^source=' "$RUN_FILE" | cut -d= -f2-)"
+  PRETAG="$(grep '^pretag=' "$RUN_FILE" | cut -d= -f2-)"
+  RUN_SHAS=()
+  while IFS= read -r line; do
+    RUN_SHAS+=("$line")
+  done < <(grep '^sha=' "$RUN_FILE" | cut -d= -f2-)
+
+  [[ ${#RUN_SHAS[@]} -gt 0 ]] || die "Run file '$RUN_FILE' has no recorded commits."
+
+  info "Reverting run: $(basename "$RUN_FILE")  (source=$SRC, ${#RUN_SHAS[@]} commit(s), pre-run tag=$PRETAG)"
+
+  # Reverse chronological order: undo most-recent-first.
+  REVERSED=()
+  for ((idx=${#RUN_SHAS[@]}-1; idx>=0; idx--)); do
+    sha="${RUN_SHAS[idx]}"
+    if git log "$TARGET" --grep="This reverts commit $sha" --oneline | grep -q .; then
+      continue  # already reverted in an earlier run
+    fi
+    REVERSED+=("$sha")
+  done
+
+  if [[ ${#REVERSED[@]} -eq 0 ]]; then
+    info "Every commit in this run has already been reverted. Nothing to do."
+    exit 0
+  fi
+
+  echo
+  info "Commits that will be reverted on '$TARGET' (most recent first):"
+  echo
+  for sha in "${REVERSED[@]}"; do
+    git log -1 --pretty=format:'  %h  %ad  %an  %s' --date=short "$sha" 2>/dev/null || echo "  $sha (no longer in history)"
+    echo
+  done
+  echo
+
+  if [[ "$ASSUME_YES" == false ]]; then
+    confirm "Revert these ${#REVERSED[@]} commit(s) on '$TARGET'?" \
+      || { info "Aborted by user. No changes made."; exit 0; }
+  fi
+
+  git checkout --quiet "$TARGET"
+
+  for sha in "${REVERSED[@]}"; do
+    info "Reverting $(git log -1 --pretty=format:'%h %s' "$sha")"
+    if ! git revert --no-edit "$sha"; then
+      error "Conflict while reverting $sha"
+      error "Resolve it, then run:"
+      error "    git add <files> && git revert --continue"
+      error "  (or 'git revert --abort' to bail out)"
+      error "Re-run '--revert $TARGET' afterwards - already-reverted commits are skipped automatically."
+      exit 1
+    fi
+  done
+
+  echo
+  info "Done. ${#REVERSED[@]} commit(s) reverted on '$TARGET'."
+  info "(This added new commits; '$TARGET' history is preserved. Push when ready.)"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# MODE: reset-clean (destructive - hard reset to pre-run state)
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "reset-clean" ]]; then
+  RUN_FILE="$(find_run_file "$TARGET" "$RUN_N")"
+  SRC="$(grep '^source=' "$RUN_FILE" | cut -d= -f2-)"
+  PRETAG="$(grep '^pretag=' "$RUN_FILE" | cut -d= -f2-)"
+
+  git rev-parse --verify --quiet "$PRETAG" >/dev/null \
+    || die "Pre-run tag '$PRETAG' no longer exists - cannot reset-clean this run. Use --revert instead."
+
+  warn "This will HARD RESET '$TARGET' to '$PRETAG', discarding any commits made on"
+  warn "'$TARGET' after that point - including the hotfix batch from '$SRC' AND anything"
+  warn "else committed to '$TARGET' since then. This rewrites history."
+  warn "If '$TARGET' has already been pushed, you will need to force-push"
+  warn "(git push --force-with-lease) afterwards, and anyone who pulled will need to reset too."
+  echo
+  git log --oneline "${PRETAG}..${TARGET}" 2>/dev/null | sed 's/^/  would discard: /'
+  echo
+
+  if [[ "$ASSUME_YES" == false ]]; then
+    confirm "Type y to confirm HARD RESET of '$TARGET' to '$PRETAG'" \
+      || { info "Aborted by user. No changes made."; exit 0; }
+  fi
+
+  git checkout --quiet "$TARGET"
+  git reset --hard "$PRETAG"
+
+  echo
+  info "Done. '$TARGET' has been hard-reset to '$PRETAG' (state before this run)."
+  info "If this branch is shared/pushed: git push --force-with-lease origin $TARGET"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# MODE: apply (default)
+# ---------------------------------------------------------------------------
+if [[ "$NO_FETCH" == false ]]; then
+  info "Fetching latest refs..."
+  git fetch --quiet --all --prune
+fi
+
 SOURCE_REF="$(resolve_branch_ref "$SOURCE")"
 TARGET_REF="$(resolve_branch_ref "$TARGET")"
 
 info "Source: $SOURCE  (ref: $SOURCE_REF)"
 info "Target: $TARGET  (ref: $TARGET_REF)"
 
-# ---------------------------------------------------------------------------
-# Build the candidate commit list
-# ---------------------------------------------------------------------------
 ALL_CANDIDATES=$(git log "${TARGET_REF}..${SOURCE_REF}" --no-merges --reverse --pretty=%H)
 
 if [[ -z "$ALL_CANDIDATES" ]]; then
@@ -164,21 +353,24 @@ done
 echo
 
 if [[ "$DRY_RUN" == true ]]; then
-  info "Dry run - no changes made. ${#TO_APPLY[@]} commit(s) would be cherry-picked."
+  if [[ "$SQUASH" == true ]]; then
+    info "Dry run - no changes made. ${#TO_APPLY[@]} commit(s) would be squashed into 1 commit on '$TARGET'."
+  else
+    info "Dry run - no changes made. ${#TO_APPLY[@]} commit(s) would be cherry-picked."
+  fi
   exit 0
 fi
 
-# ---------------------------------------------------------------------------
-# Confirmation
-# ---------------------------------------------------------------------------
 if [[ "$INTERACTIVE" == false && "$ASSUME_YES" == false ]]; then
-  confirm "Cherry-pick these ${#TO_APPLY[@]} commit(s) from '$SOURCE' onto '$TARGET'?" \
-    || { info "Aborted by user. No changes made."; exit 0; }
+  if [[ "$SQUASH" == true ]]; then
+    confirm "Squash these ${#TO_APPLY[@]} commit(s) from '$SOURCE' into a single commit on '$TARGET'?" \
+      || { info "Aborted by user. No changes made."; exit 0; }
+  else
+    confirm "Cherry-pick these ${#TO_APPLY[@]} commit(s) from '$SOURCE' onto '$TARGET'?" \
+      || { info "Aborted by user. No changes made."; exit 0; }
+  fi
 fi
 
-# ---------------------------------------------------------------------------
-# Checkout target and apply
-# ---------------------------------------------------------------------------
 info "Checking out '$TARGET'..."
 if git show-ref --verify --quiet "refs/heads/$TARGET"; then
   git checkout --quiet "$TARGET"
@@ -186,44 +378,125 @@ else
   git checkout --quiet -b "$TARGET" "$TARGET_REF"
 fi
 
+# Record a pre-run tag + run log so this batch can be undone later.
+TS="$(date -u +%Y%m%dT%H%M%SZ)"
+PRETAG="pre-hotfix/${TARGET}/${TS}"
+git tag -a "$PRETAG" -m "State of $TARGET before cherry-picking from $SOURCE" HEAD
+
+STATE_DIR="$STATE_ROOT/$TARGET"
+mkdir -p "$STATE_DIR"
+RUN_FILE="$STATE_DIR/${TS}.log"
+{
+  echo "source=$SOURCE"
+  echo "pretag=$PRETAG"
+} > "$RUN_FILE"
+
 APPLIED=()
 SKIPPED=()
 
-for sha in "${TO_APPLY[@]}"; do
-  subject="$(git log -1 --pretty=format:'%h %s' "$sha")"
+if [[ "$SQUASH" == true ]]; then
+  # All-or-nothing: -n (--no-commit) does not set up sequencer state on
+  # conflict, so 'git cherry-pick --continue/--abort' are not available here.
+  # If any pick conflicts, the whole squash is rolled back cleanly and the
+  # user is pointed at the normal (non-squash) mode for step-by-step resolution.
+  for sha in "${TO_APPLY[@]}"; do
+    subject="$(git log -1 --pretty=format:'%h %s' "$sha")"
 
-  if [[ "$INTERACTIVE" == true ]]; then
-    read -r -p "Apply commit $subject ? [y/n/s(kip)/q(uit)] " choice
-    case "$choice" in
-      [Yy]) : ;;
-      [Ss]) info "Skipping $subject"; SKIPPED+=("$sha"); continue ;;
-      [Qq]) info "Stopping at user request. ${#APPLIED[@]} commit(s) applied so far."; break ;;
-      *) info "Skipping $subject (no confirmation)"; SKIPPED+=("$sha"); continue ;;
-    esac
+    if [[ "$INTERACTIVE" == true ]]; then
+      read -r -p "Include commit $subject in the squash? [y/n/s(kip)/q(uit)] " choice
+      case "$choice" in
+        [Yy]) : ;;
+        [Ss]) info "Skipping $subject"; SKIPPED+=("$sha"); continue ;;
+        [Qq]) info "Stopping at user request before staging any commits."; break ;;
+        *) info "Skipping $subject (no confirmation)"; SKIPPED+=("$sha"); continue ;;
+      esac
+    fi
+
+    info "Staging $subject (squash)"
+    if ! git cherry-pick -n "$sha"; then
+      error "Conflict while staging $subject for the squash."
+      git cherry-pick --abort >/dev/null 2>&1 || true
+      git reset --hard "$PRETAG" --quiet
+      git tag -d "$PRETAG" >/dev/null 2>&1
+      rm -f "$RUN_FILE"
+      error "Squash aborted - '$TARGET' restored to its pre-run state, nothing was committed."
+      error "Re-run without --squash to resolve this conflict step-by-step instead."
+      exit 1
+    fi
+    APPLIED+=("$sha")
+  done
+
+  if [[ ${#APPLIED[@]} -eq 0 ]]; then
+    info "Nothing to squash (all commits skipped). No changes made."
+    git tag -d "$PRETAG" >/dev/null 2>&1
+    rm -f "$RUN_FILE"
+    exit 0
   fi
 
-  info "Cherry-picking $subject"
-  if ! git cherry-pick -x "$sha"; then
-    error "Conflict while cherry-picking $subject"
-    error "Resolve it, then run:"
-    error "    git add <files> && git cherry-pick --continue"
-    error "  (or 'git cherry-pick --abort' to bail out)"
-    error "Re-run this script afterwards - already-applied commits are detected and skipped automatically."
-    exit 1
-  fi
-  APPLIED+=("$sha")
-done
+  {
+    echo "Hotfix: squashed ${#APPLIED[@]} commit(s) from '$SOURCE' into '$TARGET'"
+    echo
+    echo "Includes:"
+    for sha in "${APPLIED[@]}"; do
+      git log -1 --pretty=format:'  %h %s' "$sha"
+      echo
+    done
+  } > /tmp/cherry-pick-hotfix-squash-msg.$$
 
-echo
-info "Done. ${#APPLIED[@]} commit(s) applied, ${#SKIPPED[@]} skipped."
-if [[ ${#APPLIED[@]} -gt 0 ]]; then
+  git commit --quiet --file=/tmp/cherry-pick-hotfix-squash-msg.$$
+  rm -f /tmp/cherry-pick-hotfix-squash-msg.$$
+
+  NEW_SHA="$(git rev-parse HEAD)"
+  echo "sha=$NEW_SHA" >> "$RUN_FILE"
+
   echo
-  git log --oneline -n "${#APPLIED[@]}"
+  info "Done. ${#APPLIED[@]} commit(s) squashed into 1 commit on '$TARGET', ${#SKIPPED[@]} skipped."
+  echo
+  git log --oneline -n 1
+  echo
+  info "Recorded as a run you can undo later:"
+  info "  Safe undo (adds a revert commit): ./$( basename "$0") --revert $TARGET"
+  info "  Hard reset (rewrites history):    ./$( basename "$0") --reset-clean $TARGET"
+else
+  for sha in "${TO_APPLY[@]}"; do
+    subject="$(git log -1 --pretty=format:'%h %s' "$sha")"
+
+    if [[ "$INTERACTIVE" == true ]]; then
+      read -r -p "Apply commit $subject ? [y/n/s(kip)/q(uit)] " choice
+      case "$choice" in
+        [Yy]) : ;;
+        [Ss]) info "Skipping $subject"; SKIPPED+=("$sha"); continue ;;
+        [Qq]) info "Stopping at user request. ${#APPLIED[@]} commit(s) applied so far."; break ;;
+        *) info "Skipping $subject (no confirmation)"; SKIPPED+=("$sha"); continue ;;
+      esac
+    fi
+
+    info "Cherry-picking $subject"
+    if ! git cherry-pick -x "$sha"; then
+      error "Conflict while cherry-picking $subject"
+      error "Resolve it, then run:"
+      error "    git add <files> && git cherry-pick --continue"
+      error "  (or 'git cherry-pick --abort' to bail out)"
+      error "Re-run this script afterwards - already-applied commits are detected and skipped automatically."
+      exit 1
+    fi
+    NEW_SHA="$(git rev-parse HEAD)"
+    echo "sha=$NEW_SHA" >> "$RUN_FILE"
+    APPLIED+=("$sha")
+  done
+
+  echo
+  info "Done. ${#APPLIED[@]} commit(s) applied, ${#SKIPPED[@]} skipped."
+  if [[ ${#APPLIED[@]} -gt 0 ]]; then
+    echo
+    git log --oneline -n "${#APPLIED[@]}"
+    echo
+    info "Recorded as a run you can undo later:"
+    info "  Safe undo (adds revert commits):  ./$( basename "$0") --revert $TARGET"
+    info "  Hard reset (rewrites history):    ./$( basename "$0") --reset-clean $TARGET"
+  fi
 fi
 
-# ---------------------------------------------------------------------------
-# Optional push
-# ---------------------------------------------------------------------------
 if [[ "$DO_PUSH" == true && ${#APPLIED[@]} -gt 0 ]]; then
   if confirm "Push '$TARGET' to origin now?"; then
     git push origin "$TARGET"
